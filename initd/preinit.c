@@ -91,7 +91,10 @@ static void
 spawn_procd(struct uloop_process *proc, int ret)
 {
 	char *wdt_fd = watchdog_fd();
-	char *argv[] = { "/sbin/procd", NULL};
+#ifndef PROCD_CUSTOM_SPAWN_PATH
+#define PROCD_CUSTOM_SPAWN_PATH "/sbin/procd"
+#endif
+	char *argv[] = { PROCD_CUSTOM_SPAWN_PATH, NULL};
 	char dbg[2];
 
 	if (plugd_proc.pid > 0)

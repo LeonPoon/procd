@@ -80,7 +80,11 @@ main(int argc, char **argv)
 
 	early();
 	cmdline();
+#ifndef WATCHDOG_DISABLE
 	watchdog_init(1);
+#endif
+	//watchdog_set_magicclose(true);
+	//watchdog_set_stopped(true);
 
 	pid = fork();
 	if (!pid) {

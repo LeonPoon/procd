@@ -44,7 +44,9 @@ struct service_instance {
 
 	char *user;
 	uid_t uid;
-	gid_t gid;
+	gid_t pw_gid;
+	char *group;
+	gid_t gr_gid;
 
 	bool halt;
 	bool restart;
@@ -59,6 +61,7 @@ struct service_instance {
 	struct jail jail;
 	char *seccomp;
 	char *pidfile;
+	int syslog_facility;
 
 	uint32_t term_timeout;
 	uint32_t respawn_timeout;

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2017 Matthias Schiffer <mschiffer@universe-factory.net>
+ * Copyright (C) 2019 Paul Spooren <mail@aparcar.de>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License version 2.1
@@ -11,13 +11,17 @@
  * GNU General Public License for more details.
  */
 
-#ifndef __PROCD_SYSUPGRADE_H
-#define __PROCD_SYSUPGRADE_H
+#ifndef __CONTAINER_H
+#define __CONTAINER_H
 
-struct blob_attr;
+#include <stdlib.h>
+#include <stdbool.h>
+#include <sys/stat.h>
 
-void sysupgrade_exec_upgraded(const char *prefix, char *path, char *command,
-			      struct blob_attr *options);
-
+static inline bool is_container() {
+	struct stat s;
+	int r = stat("/.dockerenv", &s);
+	return !!getenv("container") || r == 0;
+}
 
 #endif

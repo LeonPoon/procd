@@ -26,6 +26,8 @@
 #include <pwd.h>
 #include <libgen.h>
 #include <unistd.h>
+#define SYSLOG_NAMES
+#include <syslog.h>
 
 #include <libubox/md5.h>
 
@@ -48,6 +50,7 @@ enum {
 	INSTANCE_ATTR_WATCH,
 	INSTANCE_ATTR_ERROR,
 	INSTANCE_ATTR_USER,
+	INSTANCE_ATTR_GROUP,
 	INSTANCE_ATTR_STDOUT,
 	INSTANCE_ATTR_STDERR,
 	INSTANCE_ATTR_NO_NEW_PRIVS,
@@ -57,6 +60,7 @@ enum {
 	INSTANCE_ATTR_PIDFILE,
 	INSTANCE_ATTR_RELOADSIG,
 	INSTANCE_ATTR_TERMTIMEOUT,
+	INSTANCE_ATTR_FACILITY,
 	__INSTANCE_ATTR_MAX
 };
 
@@ -73,6 +77,7 @@ static const struct blobmsg_policy instance_attr[__INSTANCE_ATTR_MAX] = {
 	[INSTANCE_ATTR_WATCH] = { "watch", BLOBMSG_TYPE_ARRAY },
 	[INSTANCE_ATTR_ERROR] = { "error", BLOBMSG_TYPE_ARRAY },
 	[INSTANCE_ATTR_USER] = { "user", BLOBMSG_TYPE_STRING },
+	[INSTANCE_ATTR_GROUP] = { "group", BLOBMSG_TYPE_STRING },
 	[INSTANCE_ATTR_STDOUT] = { "stdout", BLOBMSG_TYPE_BOOL },
 	[INSTANCE_ATTR_STDERR] = { "stderr", BLOBMSG_TYPE_BOOL },
 	[INSTANCE_ATTR_NO_NEW_PRIVS] = { "no_new_privs", BLOBMSG_TYPE_BOOL },
@@ -82,6 +87,7 @@ static const struct blobmsg_policy instance_attr[__INSTANCE_ATTR_MAX] = {
 	[INSTANCE_ATTR_PIDFILE] = { "pidfile", BLOBMSG_TYPE_STRING },
 	[INSTANCE_ATTR_RELOADSIG] = { "reload_signal", BLOBMSG_TYPE_INT32 },
 	[INSTANCE_ATTR_TERMTIMEOUT] = { "term_timeout", BLOBMSG_TYPE_INT32 },
+	[INSTANCE_ATTR_FACILITY] = { "facility", BLOBMSG_TYPE_STRING },
 };
 
 enum {
@@ -146,6 +152,18 @@ static void closefd(int fd)
 {
 	if (fd > STDERR_FILENO)
 		close(fd);
+}
+
+/* convert a string into numeric syslog facility or return -1 if no match found */
+static int
+syslog_facility_str_to_int(const char *facility)
+{
+	CODE *p = facilitynames;
+
+	while (p->c_name && strcasecmp(p->c_name, facility))
+		p++;
+
+	return p->c_val;
 }
 
 static void
@@ -348,12 +366,12 @@ instance_run(struct service_instance *in, int _stdout, int _stderr)
 		closefd(_stderr);
 	}
 
-	if (in->user && in->gid && initgroups(in->user, in->gid)) {
+	if (in->user && in->pw_gid && initgroups(in->user, in->pw_gid)) {
 		ERROR("failed to initgroups() for user %s: %m\n", in->user);
 		exit(127);
 	}
-	if (in->gid && setgid(in->gid)) {
-		ERROR("failed to set group id %d: %m\n", in->gid);
+	if (in->gr_gid && setgid(in->gr_gid)) {
+		ERROR("failed to set group id %d: %m\n", in->gr_gid);
 		exit(127);
 	}
 	if (in->uid && setuid(in->uid)) {
@@ -466,7 +484,7 @@ instance_stdio(struct ustream *s, int prio, struct service_instance *in)
 
 	arg0 = basename(blobmsg_data(blobmsg_data(in->command)));
 	snprintf(ident, sizeof(ident), "%s[%d]", arg0, in->proc.pid);
-	ulog_open(ULOG_SYSLOG, LOG_DAEMON, ident);
+	ulog_open(ULOG_SYSLOG, in->syslog_facility, ident);
 
 	do {
 		str = ustream_get_read_buf(s, &len);
@@ -519,6 +537,16 @@ instance_timeout(struct uloop_timeout *t)
 }
 
 static void
+instance_delete(struct service_instance *in)
+{
+	struct service *s = in->srv;
+
+	avl_delete(&s->instances.avl, &in->node.avl);
+	instance_free(in);
+	service_stopped(s);
+}
+
+static void
 instance_exit(struct uloop_process *p, int ret)
 {
 	struct service_instance *in;
@@ -539,13 +567,8 @@ instance_exit(struct uloop_process *p, int ret)
 		instance_removepid(in);
 		if (in->restart)
 			instance_start(in);
-		else {
-			struct service *s = in->srv;
-
-			avl_delete(&s->instances.avl, &in->node.avl);
-			instance_free(in);
-			service_stopped(s);
-		}
+		else
+			instance_delete(in);
 	} else if (in->restart) {
 		instance_start(in);
 	} else if (in->respawn) {
@@ -569,8 +592,11 @@ instance_exit(struct uloop_process *p, int ret)
 void
 instance_stop(struct service_instance *in, bool halt)
 {
-	if (!in->proc.pending)
+	if (!in->proc.pending) {
+		if (halt)
+			instance_delete(in);
 		return;
+	}
 	in->halt = halt;
 	in->restart = in->respawn = false;
 	kill(in->proc.pid, SIGTERM);
@@ -620,13 +646,19 @@ instance_config_changed(struct service_instance *in, struct service_instance *in
 	if (in->nice != in_new->nice)
 		return true;
 
+	if (in->syslog_facility != in_new->syslog_facility)
+		return true;
+
 	if (string_changed(in->user, in_new->user))
+		return true;
+
+	if (string_changed(in->group, in_new->group))
 		return true;
 
 	if (in->uid != in_new->uid)
 		return true;
 
-	if (in->gid != in_new->gid)
+	if (in->pw_gid != in_new->pw_gid)
 		return true;
 
 	if (string_changed(in->pidfile, in_new->pidfile))
@@ -882,7 +914,16 @@ instance_config_parse(struct service_instance *in)
 		if (p) {
 			in->user = strdup(user);
 			in->uid = p->pw_uid;
-			in->gid = p->pw_gid;
+			in->gr_gid = in->pw_gid = p->pw_gid;
+		}
+	}
+
+	if (tb[INSTANCE_ATTR_GROUP]) {
+		const char *group = blobmsg_get_string(tb[INSTANCE_ATTR_GROUP]);
+		struct group *p = getgrnam(group);
+		if (p) {
+			in->group = strdup(group);
+			in->gr_gid = p->gr_gid;
 		}
 	}
 
@@ -930,6 +971,15 @@ instance_config_parse(struct service_instance *in)
 	if (!instance_fill_array(&in->errors, tb[INSTANCE_ATTR_ERROR], NULL, true))
 		return false;
 
+	if (tb[INSTANCE_ATTR_FACILITY]) {
+		int facility = syslog_facility_str_to_int(blobmsg_get_string(tb[INSTANCE_ATTR_FACILITY]));
+		if (facility != -1) {
+			in->syslog_facility = facility;
+			DEBUG(3, "setting facility '%s'\n", blobmsg_get_string(tb[INSTANCE_ATTR_FACILITY]));
+		} else
+			DEBUG(3, "unknown syslog facility '%s' given, using default (LOG_DAEMON)\n", blobmsg_get_string(tb[INSTANCE_ATTR_FACILITY]));
+	}
+
 	return true;
 }
 
@@ -959,6 +1009,7 @@ instance_config_move(struct service_instance *in, struct service_instance *in_sr
 	in->trigger = in_src->trigger;
 	in->command = in_src->command;
 	in->pidfile = in_src->pidfile;
+	in->respawn = in_src->respawn;
 	in->respawn_retry = in_src->respawn_retry;
 	in->respawn_threshold = in_src->respawn_threshold;
 	in->respawn_timeout = in_src->respawn_timeout;
@@ -966,6 +1017,7 @@ instance_config_move(struct service_instance *in, struct service_instance *in_sr
 	in->trace = in_src->trace;
 	in->seccomp = in_src->seccomp;
 	in->node.avl.key = in_src->node.avl.key;
+	in->syslog_facility = in_src->syslog_facility;
 
 	free(in->config);
 	in->config = in_src->config;
@@ -1001,6 +1053,7 @@ instance_free(struct service_instance *in)
 	instance_config_cleanup(in);
 	free(in->config);
 	free(in->user);
+	free(in->group);
 	free(in);
 }
 
@@ -1014,6 +1067,7 @@ instance_init(struct service_instance *in, struct service *s, struct blob_attr *
 	in->timeout.cb = instance_timeout;
 	in->proc.cb = instance_exit;
 	in->term_timeout = 5;
+	in->syslog_facility = LOG_DAEMON;
 
 	in->_stdout.fd.fd = -2;
 	in->_stdout.stream.string_data = true;
@@ -1102,6 +1156,12 @@ void instance_dump(struct blob_buf *b, struct service_instance *in, int verbose)
 
 	if (in->pidfile)
 		blobmsg_add_string(b, "pidfile", in->pidfile);
+
+	if (in->user)
+		blobmsg_add_string(b, "user", in->user);
+
+	if (in->group)
+		blobmsg_add_string(b, "group", in->group);
 
 	if (in->has_jail) {
 		void *r = blobmsg_open_table(b, "jail");

@@ -25,6 +25,8 @@
 #include <unistd.h>
 #include <stdlib.h>
 
+#include <json-c/json_tokener.h>
+#include <libubox/blobmsg_json.h>
 #include <libubox/uloop.h>
 
 #include "procd.h"
@@ -228,9 +230,36 @@ static int system_info(struct ubus_context *ctx, struct ubus_object *obj,
 #ifdef linux
 	struct sysinfo info;
 	void *c;
+	char line[256];
+	char *key, *val;
+	unsigned long long available, cached;
+	FILE *f;
 
 	if (sysinfo(&info))
 		return UBUS_STATUS_UNKNOWN_ERROR;
+
+	if ((f = fopen("/proc/meminfo", "r")) == NULL)
+		return UBUS_STATUS_UNKNOWN_ERROR;
+
+	/* if linux < 3.14 MemAvailable is not in meminfo */
+	available = 0;
+	cached = 0;
+
+	while (fgets(line, sizeof(line), f))
+	{
+		key = strtok(line, " :");
+		val = strtok(NULL, " ");
+
+		if (!key || !val)
+			continue;
+
+		if (!strcasecmp(key, "MemAvailable"))
+			available = 1024 * atoll(val);
+		else if (!strcasecmp(key, "Cached"))
+			cached = 1024 * atoll(val);
+	}
+
+	fclose(f);
 #endif
 
 	now = time(NULL);
@@ -252,15 +281,23 @@ static int system_info(struct ubus_context *ctx, struct ubus_object *obj,
 	blobmsg_close_array(&b, c);
 
 	c = blobmsg_open_table(&b, "memory");
-	blobmsg_add_u64(&b, "total",    info.mem_unit * info.totalram);
-	blobmsg_add_u64(&b, "free",     info.mem_unit * info.freeram);
-	blobmsg_add_u64(&b, "shared",   info.mem_unit * info.sharedram);
-	blobmsg_add_u64(&b, "buffered", info.mem_unit * info.bufferram);
+	blobmsg_add_u64(&b, "total",
+			(uint64_t)info.mem_unit * (uint64_t)info.totalram);
+	blobmsg_add_u64(&b, "free",
+			(uint64_t)info.mem_unit * (uint64_t)info.freeram);
+	blobmsg_add_u64(&b, "shared",
+			(uint64_t)info.mem_unit * (uint64_t)info.sharedram);
+	blobmsg_add_u64(&b, "buffered",
+			(uint64_t)info.mem_unit * (uint64_t)info.bufferram);
+	blobmsg_add_u64(&b, "available", available);
+	blobmsg_add_u64(&b, "cached", cached);
 	blobmsg_close_table(&b, c);
 
 	c = blobmsg_open_table(&b, "swap");
-	blobmsg_add_u64(&b, "total",    info.mem_unit * info.totalswap);
-	blobmsg_add_u64(&b, "free",     info.mem_unit * info.freeswap);
+	blobmsg_add_u64(&b, "total",
+			(uint64_t)info.mem_unit * (uint64_t)info.totalswap);
+	blobmsg_add_u64(&b, "free",
+			(uint64_t)info.mem_unit * (uint64_t)info.freeswap);
 	blobmsg_close_table(&b, c);
 #endif
 
@@ -376,8 +413,121 @@ static int proc_signal(struct ubus_context *ctx, struct ubus_object *obj,
 	return 0;
 }
 
+/**
+ * validate_firmware_image_call - perform validation & store result in global b
+ *
+ * @file: firmware image path
+ */
+static int validate_firmware_image_call(const char *file)
+{
+	const char *path = "/usr/libexec/validate_firmware_image";
+	json_object *jsobj = NULL;
+	json_tokener *tok;
+	char buf[64];
+	ssize_t len;
+	int fds[2];
+	int err;
+	int fd;
+
+	if (pipe(fds))
+		return -errno;
+
+	switch (fork()) {
+	case -1:
+		return -errno;
+	case 0:
+		/* Set stdin & stderr to /dev/null */
+		fd = open("/dev/null", O_RDWR);
+		if (fd >= 0) {
+			dup2(fd, 0);
+			dup2(fd, 2);
+			close(fd);
+		}
+
+		/* Set stdout to the shared pipe */
+		dup2(fds[1], 1);
+		close(fds[0]);
+		close(fds[1]);
+
+		execl(path, path, file, NULL);
+		exit(errno);
+	}
+
+	/* Parent process */
+
+	tok = json_tokener_new();
+	if (!tok) {
+		close(fds[0]);
+		close(fds[1]);
+		return -ENOMEM;
+	}
+
+	blob_buf_init(&b, 0);
+	while ((len = read(fds[0], buf, sizeof(buf)))) {
+		jsobj = json_tokener_parse_ex(tok, buf, len);
+
+		if (json_tokener_get_error(tok) == json_tokener_success)
+			break;
+		else if (json_tokener_get_error(tok) == json_tokener_continue)
+			continue;
+		else
+			fprintf(stderr, "Failed to parse JSON: %d\n",
+				json_tokener_get_error(tok));
+	}
+
+	close(fds[0]);
+	close(fds[1]);
+
+	err = -ENOENT;
+	if (jsobj) {
+		if (json_object_get_type(jsobj) == json_type_object) {
+			blobmsg_add_object(&b, jsobj);
+			err = 0;
+		}
+
+		json_object_put(jsobj);
+	}
+
+	json_tokener_free(tok);
+
+	return err;
+}
+
+enum {
+	VALIDATE_FIRMWARE_IMAGE_PATH,
+	__VALIDATE_FIRMWARE_IMAGE_MAX,
+};
+
+static const struct blobmsg_policy validate_firmware_image_policy[__VALIDATE_FIRMWARE_IMAGE_MAX] = {
+	[VALIDATE_FIRMWARE_IMAGE_PATH] = { .name = "path", .type = BLOBMSG_TYPE_STRING },
+};
+
+static int validate_firmware_image(struct ubus_context *ctx,
+				   struct ubus_object *obj,
+				   struct ubus_request_data *req,
+				   const char *method, struct blob_attr *msg)
+{
+	struct blob_attr *tb[__VALIDATE_FIRMWARE_IMAGE_MAX];
+
+	if (!msg)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	blobmsg_parse(validate_firmware_image_policy, __VALIDATE_FIRMWARE_IMAGE_MAX, tb, blob_data(msg), blob_len(msg));
+	if (!tb[VALIDATE_FIRMWARE_IMAGE_PATH])
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	if (validate_firmware_image_call(blobmsg_get_string(tb[VALIDATE_FIRMWARE_IMAGE_PATH])))
+		return UBUS_STATUS_UNKNOWN_ERROR;
+
+	ubus_send_reply(ctx, req, b.head);
+
+	return UBUS_STATUS_OK;
+}
+
 enum {
 	SYSUPGRADE_PATH,
+	SYSUPGRADE_FORCE,
+	SYSUPGRADE_BACKUP,
 	SYSUPGRADE_PREFIX,
 	SYSUPGRADE_COMMAND,
 	SYSUPGRADE_OPTIONS,
@@ -386,16 +536,46 @@ enum {
 
 static const struct blobmsg_policy sysupgrade_policy[__SYSUPGRADE_MAX] = {
 	[SYSUPGRADE_PATH] = { .name = "path", .type = BLOBMSG_TYPE_STRING },
+	[SYSUPGRADE_FORCE] = { .name = "force", .type = BLOBMSG_TYPE_BOOL },
+	[SYSUPGRADE_BACKUP] = { .name = "backup", .type = BLOBMSG_TYPE_STRING },
 	[SYSUPGRADE_PREFIX] = { .name = "prefix", .type = BLOBMSG_TYPE_STRING },
 	[SYSUPGRADE_COMMAND] = { .name = "command", .type = BLOBMSG_TYPE_STRING },
 	[SYSUPGRADE_OPTIONS] = { .name = "options", .type = BLOBMSG_TYPE_TABLE },
 };
 
+static void sysupgrade_error(struct ubus_context *ctx,
+			     struct ubus_request_data *req,
+			     const char *message)
+{
+	void *c;
+
+	blob_buf_init(&b, 0);
+
+	c = blobmsg_open_table(&b, "error");
+	blobmsg_add_string(&b, "message", message);
+	blobmsg_close_table(&b, c);
+
+	ubus_send_reply(ctx, req, b.head);
+}
+
 static int sysupgrade(struct ubus_context *ctx, struct ubus_object *obj,
 		      struct ubus_request_data *req, const char *method,
 		      struct blob_attr *msg)
 {
+	enum {
+		VALIDATION_VALID,
+		VALIDATION_FORCEABLE,
+		VALIDATION_ALLOW_BACKUP,
+		__VALIDATION_MAX
+	};
+	static const struct blobmsg_policy validation_policy[__VALIDATION_MAX] = {
+		[VALIDATION_VALID] = { .name = "valid", .type = BLOBMSG_TYPE_BOOL },
+		[VALIDATION_FORCEABLE] = { .name = "forceable", .type = BLOBMSG_TYPE_BOOL },
+		[VALIDATION_ALLOW_BACKUP] = { .name = "allow_backup", .type = BLOBMSG_TYPE_BOOL },
+	};
+	struct blob_attr *validation[__VALIDATION_MAX];
 	struct blob_attr *tb[__SYSUPGRADE_MAX];
+	bool valid, forceable, allow_backup;
 
 	if (!msg)
 		return UBUS_STATUS_INVALID_ARGUMENT;
@@ -404,8 +584,33 @@ static int sysupgrade(struct ubus_context *ctx, struct ubus_object *obj,
 	if (!tb[SYSUPGRADE_PATH] || !tb[SYSUPGRADE_PREFIX])
 		return UBUS_STATUS_INVALID_ARGUMENT;
 
+	if (validate_firmware_image_call(blobmsg_get_string(tb[SYSUPGRADE_PATH]))) {
+		sysupgrade_error(ctx, req, "Firmware image couldn't be validated");
+		return UBUS_STATUS_UNKNOWN_ERROR;
+	}
+
+	blobmsg_parse(validation_policy, __VALIDATION_MAX, validation, blob_data(b.head), blob_len(b.head));
+
+	valid = validation[VALIDATION_VALID] && blobmsg_get_bool(validation[VALIDATION_VALID]);
+	forceable = validation[VALIDATION_FORCEABLE] && blobmsg_get_bool(validation[VALIDATION_FORCEABLE]);
+	allow_backup = validation[VALIDATION_ALLOW_BACKUP] && blobmsg_get_bool(validation[VALIDATION_ALLOW_BACKUP]);
+
+	if (!valid) {
+		if (!forceable) {
+			sysupgrade_error(ctx, req, "Firmware image is broken and cannot be installed");
+			return UBUS_STATUS_NOT_SUPPORTED;
+		} else if (!tb[SYSUPGRADE_FORCE] || !blobmsg_get_bool(tb[SYSUPGRADE_FORCE])) {
+			sysupgrade_error(ctx, req, "Firmware image is invalid");
+			return UBUS_STATUS_NOT_SUPPORTED;
+		}
+	} else if (!allow_backup && tb[SYSUPGRADE_BACKUP]) {
+		sysupgrade_error(ctx, req, "Firmware image doesn't allow preserving a backup");
+		return UBUS_STATUS_NOT_SUPPORTED;
+	}
+
 	sysupgrade_exec_upgraded(blobmsg_get_string(tb[SYSUPGRADE_PREFIX]),
 				 blobmsg_get_string(tb[SYSUPGRADE_PATH]),
+				 tb[SYSUPGRADE_BACKUP] ? blobmsg_get_string(tb[SYSUPGRADE_BACKUP]) : NULL,
 				 tb[SYSUPGRADE_COMMAND] ? blobmsg_get_string(tb[SYSUPGRADE_COMMAND]) : NULL,
 				 tb[SYSUPGRADE_OPTIONS]);
 
@@ -426,6 +631,7 @@ static const struct ubus_method system_methods[] = {
 	UBUS_METHOD_NOARG("reboot", system_reboot),
 	UBUS_METHOD("watchdog", watchdog_set, watchdog_policy),
 	UBUS_METHOD("signal", proc_signal, signal_policy),
+	UBUS_METHOD("validate_firmware_image", validate_firmware_image, validate_firmware_image_policy),
 	UBUS_METHOD("sysupgrade", sysupgrade, sysupgrade_policy),
 };
 

@@ -221,7 +221,7 @@ static void handle_exec(struct blob_attr *msg, struct blob_attr *data)
 		argv[i] = NULL;
 		execvp(argv[0], &argv[0]);
 	}
-	exit(-1);
+	exit(EXIT_FAILURE);
 }
 
 static void handle_button_start(struct blob_attr *msg, struct blob_attr *data)
@@ -246,7 +246,7 @@ static void handle_firmware(struct blob_attr *msg, struct blob_attr *data)
 
 	if (!file || !dir || !dev) {
 		ERROR("Request for unknown firmware %s/%s\n", dir, file);
-		exit(-1);
+		exit(EXIT_FAILURE);
 	}
 
 	path = alloca(strlen(dir) + strlen(file) + 2);
@@ -271,11 +271,11 @@ send_to_kernel:
 	load = open(loadpath, O_WRONLY);
 	if (!load) {
 		ERROR("Failed to open %s: %m\n", loadpath);
-		exit(-1);
+		exit(EXIT_FAILURE);
 	}
 	if (write(load, "1", 1) == -1) {
 		ERROR("Failed to write to %s: %m\n", loadpath);
-		exit(-1);
+		exit(EXIT_FAILURE);
 	}
 	close(load);
 
@@ -283,7 +283,7 @@ send_to_kernel:
 	fw = open(syspath, O_WRONLY);
 	if (fw < 0) {
 		ERROR("Failed to open %s: %m\n", syspath);
-		exit(-1);
+		exit(EXIT_FAILURE);
 	}
 
 	len = s.st_size;
@@ -309,7 +309,21 @@ send_to_kernel:
 
 	DEBUG(2, "Done loading %s\n", path);
 
-	exit(-1);
+	exit(EXIT_FAILURE);
+}
+
+static void handle_start_console(struct blob_attr *msg, struct blob_attr *data)
+{
+	char *dev = blobmsg_get_string(blobmsg_data(data));
+
+	DEBUG(2, "Start console request for %s\n", dev);
+
+	procd_inittab_run("respawn");
+	procd_inittab_run("askfirst");
+
+	DEBUG(2, "Done starting console for %s\n", dev);
+
+	exit(EXIT_FAILURE);
 }
 
 enum {
@@ -318,6 +332,7 @@ enum {
 	HANDLER_EXEC,
 	HANDLER_BUTTON,
 	HANDLER_FW,
+	HANDLER_START_CONSOLE,
 };
 
 static struct cmd_handler {
@@ -350,6 +365,10 @@ static struct cmd_handler {
 	[HANDLER_FW] = {
 		.name = "load-firmware",
 		.handler = handle_firmware,
+	},
+	[HANDLER_START_CONSOLE] = {
+		.name = "start-console",
+		.handler = handle_start_console,
 	},
 };
 

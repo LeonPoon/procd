@@ -25,7 +25,8 @@
 
 #include <libubox/blobmsg.h>
 
-void sysupgrade_exec_upgraded(const char *prefix, char *path, char *command,
+void sysupgrade_exec_upgraded(const char *prefix, char *path,
+			      const char *backup, char *command,
 			      struct blob_attr *options)
 {
 	char *wdt_fd = watchdog_fd();
@@ -47,6 +48,9 @@ void sysupgrade_exec_upgraded(const char *prefix, char *path, char *command,
 		watchdog_set_cloexec(false);
 		setenv("WDTFD", wdt_fd, 1);
 	}
+
+	if (backup)
+		setenv("UPGRADE_BACKUP", backup, 1);
 
 	blobmsg_for_each_attr(option, options, rem) {
 		const char *prefix = "UPGRADE_OPT_";

@@ -23,7 +23,7 @@
 #include <libubus.h>
 
 #include <stdio.h>
-
+#include <stdlib.h>
 #include <unistd.h>
 
 #include "init.h"
@@ -75,7 +75,7 @@ check_sysupgrade(void)
 
 	fclose(sysupgrade);
 
-	sysupgrade_exec_upgraded(prefix, path, command, NULL);
+	sysupgrade_exec_upgraded(prefix, path, NULL, command, NULL);
 
 	while (true)
 		sleep(1);
@@ -138,7 +138,7 @@ preinit(void)
 	if (!plugd_proc.pid) {
 		execvp(plug[0], plug);
 		ERROR("Failed to start plugd: %m\n");
-		exit(-1);
+		exit(EXIT_FAILURE);
 	}
 	if (plugd_proc.pid <= 0) {
 		ERROR("Failed to start new plugd instance: %m\n");
@@ -160,7 +160,7 @@ preinit(void)
 	if (!preinit_proc.pid) {
 		execvp(init[0], init);
 		ERROR("Failed to start preinit: %m\n");
-		exit(-1);
+		exit(EXIT_FAILURE);
 	}
 	if (preinit_proc.pid <= 0) {
 		ERROR("Failed to start new preinit instance: %m\n");
